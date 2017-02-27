@@ -1,6 +1,7 @@
 /*
  * IJKFFMoviePlayerController.m
  *
+ * Copyright (c) 2013 Bilibili
  * Copyright (c) 2013 Zhang Rui <bbcallen@gmail.com>
  *
  * This file is part of ijkPlayer.
@@ -29,11 +30,18 @@
 #import "IJKAudioKit.h"
 #import "IJKNotificationManager.h"
 #import "NSString+IJKMedia.h"
-
+#import "ijkioapplication.h"
 #include "string.h"
-#include "ijkplayer/version.h"
 
-static const char *kIJKFFRequiredFFmpegVersion = "ff3.1--ijk0.6.1--20160824--001";
+static const char *kIJKFFRequiredFFmpegVersion = "ff3.2--ijk0.7.6--20170203--001";
+
+// It means you didn't call shutdown if you found this object leaked.
+@interface IJKWeakHolder : NSObject
+@property (nonatomic, weak) id object;
+@end
+
+@implementation IJKWeakHolder
+@end
 
 @interface IJKFFMoviePlayerController()
 
@@ -62,6 +70,7 @@ static const char *kIJKFFRequiredFFmpegVersion = "ff3.1--ijk0.6.1--20160824--001
     IJKNotificationManager *_notificationManager;
 
     AVAppAsyncStatistic _asyncStat;
+    IjkIOAppCacheStatistic _cacheStat;
     BOOL _shouldShowHudView;
     NSTimer *_hudTimer;
 }
@@ -175,7 +184,7 @@ void IJKFFIOStatCompleteRegister(void (*cb)(const char *url,
         _scalingMode = IJKMPMovieScalingModeAspectFit;
         _shouldAutoplay = YES;
         memset(&_asyncStat, 0, sizeof(_asyncStat));
-
+        memset(&_cacheStat, 0, sizeof(_cacheStat));
         _monitor = [[IJKFFMonitor alloc] init];
 
         // init media resource
@@ -184,9 +193,12 @@ void IJKFFIOStatCompleteRegister(void (*cb)(const char *url,
         // init player
         _mediaPlayer = ijkmp_ios_create(media_player_msg_loop);
         _msgPool = [[IJKFFMoviePlayerMessagePool alloc] init];
+        IJKWeakHolder *weakHolder = [IJKWeakHolder new];
+        weakHolder.object = self;
 
         ijkmp_set_weak_thiz(_mediaPlayer, (__bridge_retained void *) self);
-        ijkmp_set_inject_opaque(_mediaPlayer, (__bridge void *) self);
+        ijkmp_set_inject_opaque(_mediaPlayer, (__bridge_retained void *) weakHolder);
+        ijkmp_set_ijkio_inject_opaque(_mediaPlayer, (__bridge_retained void *)weakHolder);
         ijkmp_set_option_int(_mediaPlayer, IJKMP_OPT_CATEGORY_PLAYER, "start-on-prepared", _shouldAutoplay ? 1 : 0);
 
         // init video sink
@@ -413,17 +425,16 @@ inline static int getPlayerOption(IJKFFOptionCategory category)
 }
 
 + (BOOL)checkIfPlayerVersionMatch:(BOOL)showAlert
-                            major:(unsigned int)major
-                            minor:(unsigned int)minor
-                            micro:(unsigned int)micro
+                          version:(NSString *)version
 {
-    unsigned int actualVersion = ijkmp_version_int();
-    if (actualVersion == AV_VERSION_INT(major, minor, micro)) {
+    const char *actualVersion = ijkmp_version();
+    const char *expectVersion = version.UTF8String;
+    if (0 == strcmp(actualVersion, expectVersion)) {
         return YES;
     } else {
         if (showAlert) {
-            NSString *message = [NSString stringWithFormat:@"actual: %s\n expect: %d.%d.%d\n",
-                                 ijkmp_version_ident(), major, minor, micro];
+            NSString *message = [NSString stringWithFormat:@"actual: %s\n expect: %s\n",
+                                 actualVersion, expectVersion];
             UIAlertView *alertView = [[UIAlertView alloc] initWithTitle:@"Unexpected ijkplayer version"
                                                                 message:message
                                                                delegate:nil
@@ -469,6 +480,8 @@ inline static int getPlayerOption(IJKFFOptionCategory category)
     _liveOpenDelegate       = nil;
     _nativeInvokeDelegate   = nil;
 
+    __unused id weakHolder = (__bridge_transfer IJKWeakHolder*)ijkmp_set_inject_opaque(_mediaPlayer, NULL);
+    __unused id weakijkHolder = (__bridge_transfer IJKWeakHolder*)ijkmp_set_ijkio_inject_opaque(_mediaPlayer, NULL);
     ijkmp_dec_ref_p(&_mediaPlayer);
 
     [self didShutdown];
@@ -562,12 +575,16 @@ inline static int getPlayerOption(IJKFFOptionCategory category)
     NSTimeInterval demux_cache = ((NSTimeInterval)ijkmp_get_playable_duration(_mediaPlayer)) / 1000;
 
     int64_t buf_forwards = _asyncStat.buf_forwards;
-    if (buf_forwards > 0) {
-        int64_t bit_rate = ijkmp_get_property_int64(_mediaPlayer, FFP_PROP_INT64_BIT_RATE, 0);
-        if (bit_rate > 0) {
-            NSTimeInterval io_cache = ((float)buf_forwards) * 8 / bit_rate;
-            return io_cache + demux_cache;
-        }
+    int64_t cache_forwards = _cacheStat.cache_buf_forwards;
+    int64_t bit_rate = ijkmp_get_property_int64(_mediaPlayer, FFP_PROP_INT64_BIT_RATE, 0);
+
+    if (buf_forwards > 0 && bit_rate > 0) {
+        NSTimeInterval io_cache = ((float)buf_forwards) * 8 / bit_rate;
+        demux_cache += io_cache;
+    }
+    if (cache_forwards > 0 && bit_rate > 0) {
+        NSTimeInterval cache_cache = ((float)cache_forwards) * 8 / bit_rate;
+        demux_cache += cache_cache;
     }
 
     return demux_cache;
@@ -655,8 +672,8 @@ inline static NSString *formatedDurationBytesAndBitrate(int64_t bytes, int64_t b
 }
 
 inline static NSString *formatedSize(int64_t bytes) {
-    if (bytes >= 100 * 1000) {
-        return [NSString stringWithFormat:@"%.2f MB", ((float)bytes) / 1000 / 1000];
+    if (bytes >= 100 * 1024) {
+        return [NSString stringWithFormat:@"%.2f MB", ((float)bytes) / 1000 / 1024];
     } else if (bytes >= 100) {
         return [NSString stringWithFormat:@"%.1f KB", ((float)bytes) / 1000];
     } else {
@@ -732,6 +749,12 @@ inline static NSString *formatedSpeed(int64_t bytes, int64_t elapsed_milli) {
     [_glView setHudValue:[NSString stringWithFormat:@"%.3f %.3f", avdelay, -avdiff] forKey:@"delay"];
 
     int64_t bitRate = ijkmp_get_property_int64(_mediaPlayer, FFP_PROP_INT64_BIT_RATE, 0);
+    [_glView setHudValue:[NSString stringWithFormat:@"-%@, %@",
+                         formatedSize(_cacheStat.cache_buf_forwards),
+                          formatedDurationBytesAndBitrate(_cacheStat.cache_buf_forwards, bitRate)] forKey:@"cache-forwards"];
+    [_glView setHudValue:formatedSize(_cacheStat.cache_physical_pos) forKey:@"cache-physical-pos"];
+    [_glView setHudValue:formatedSize(_cacheStat.cache_file_pos) forKey:@"cache-file-pos"];
+    [_glView setHudValue:formatedSize(_cacheStat.cache_count_bytes) forKey:@"cache-bytes"];
     [_glView setHudValue:[NSString stringWithFormat:@"-%@, %@",
                           formatedSize(_asyncStat.buf_backwards),
                           formatedDurationBytesAndBitrate(_asyncStat.buf_backwards, bitRate)]
@@ -829,6 +852,20 @@ inline static NSString *formatedSpeed(int64_t bytes, int64_t elapsed_milli) {
     return ijkmp_get_property_float(_mediaPlayer, FFP_PROP_FLOAT_PLAYBACK_RATE, 0.0f);
 }
 
+- (void)setPlaybackVolume:(float)volume
+{
+    if (!_mediaPlayer)
+        return;
+    return ijkmp_set_playback_volume(_mediaPlayer, volume);
+}
+
+- (float)playbackVolume
+{
+    if (!_mediaPlayer)
+        return 0.0f;
+    return ijkmp_get_property_float(_mediaPlayer, FFP_PROP_FLOAT_PLAYBACK_VOLUME, 1.0f);
+}
+
 inline static void fillMetaInternal(NSMutableDictionary *meta, IjkMediaMeta *rawMeta, const char *name, NSString *defaultValue)
 {
     if (!meta || !rawMeta || !name)
@@ -875,6 +912,21 @@ inline static void fillMetaInternal(NSMutableDictionary *meta, IjkMediaMeta *raw
             NSLog(@"FFP_MSG_PREPARED:\n");
 
             _monitor.prepareDuration = (int64_t)SDL_GetTickHR() - _monitor.prepareStartTick;
+            int64_t vdec = ijkmp_get_property_int64(_mediaPlayer, FFP_PROP_INT64_VIDEO_DECODER, FFP_PROPV_DECODER_UNKNOWN);
+            switch (vdec) {
+                case FFP_PROPV_DECODER_VIDEOTOOLBOX:
+                    _monitor.vdecoder = @"VideoToolbox";
+                    break;
+                case FFP_PROPV_DECODER_AVCODEC:
+                    _monitor.vdecoder = [NSString stringWithFormat:@"avcodec %d.%d.%d",
+                                         LIBAVCODEC_VERSION_MAJOR,
+                                         LIBAVCODEC_VERSION_MINOR,
+                                         LIBAVCODEC_VERSION_MICRO];
+                    break;
+                default:
+                    _monitor.vdecoder = @"Unknown";
+                    break;
+            }
 
             IjkMediaMeta *rawMeta = ijkmp_get_meta_l(_mediaPlayer);
             if (rawMeta) {
@@ -949,12 +1001,13 @@ inline static void fillMetaInternal(NSMutableDictionary *meta, IjkMediaMeta *raw
                 ijkmeta_unlock(rawMeta);
                 _monitor.mediaMeta = newMediaMeta;
             }
+            ijkmp_set_playback_rate(_mediaPlayer, [self playbackRate]);
+            ijkmp_set_playback_volume(_mediaPlayer, [self playbackVolume]);
 
             [self startHudTimer];
             _isPreparedToPlay = YES;
 
             [[NSNotificationCenter defaultCenter] postNotificationName:IJKMPMediaPlaybackIsPreparedToPlayDidChangeNotification object:self];
-
             _loadState = IJKMPMovieLoadStatePlayable | IJKMPMovieLoadStatePlaythroughOK;
 
             [[NSNotificationCenter defaultCenter]
@@ -1091,7 +1144,6 @@ int media_player_msg_loop(void* arg)
     @autoreleasepool {
         IjkMediaPlayer *mp = (IjkMediaPlayer*)arg;
         __weak IJKFFMoviePlayerController *ffpController = ffplayerRetain(ijkmp_set_weak_thiz(mp, NULL));
-
         while (ffpController) {
             @autoreleasepool {
                 IJKFFMoviePlayerMessage *msg = [ffpController obtainMessage];
@@ -1201,6 +1253,16 @@ static int onInjectAsyncStatistic(IJKFFMoviePlayerController *mpc, int type, voi
     return 0;
 }
 
+static int onInectIJKIOStatistic(IJKFFMoviePlayerController *mpc, int type, void *data, size_t data_size)
+{
+    IjkIOAppCacheStatistic *realData = data;
+    assert(realData);
+    assert(sizeof(IjkIOAppCacheStatistic) == data_size);
+
+    mpc->_cacheStat = *realData;
+    return 0;
+}
+
 static int64_t calculateElapsed(int64_t begin, int64_t end)
 {
     if (begin <= 0)
@@ -1297,7 +1359,10 @@ static int onInjectOnHttpEvent(IJKFFMoviePlayerController *mpc, int type, void *
 // NOTE: could be called from multiple thread
 static int ijkff_inject_callback(void *opaque, int message, void *data, size_t data_size)
 {
-    IJKFFMoviePlayerController *mpc = (__bridge IJKFFMoviePlayerController*)opaque;
+    IJKWeakHolder *weakHolder = (__bridge IJKWeakHolder*)opaque;
+    IJKFFMoviePlayerController *mpc = weakHolder.object;
+    if (!mpc)
+        return 0;
 
     switch (message) {
         case AVAPP_CTRL_WILL_CONCAT_SEGMENT_OPEN:
@@ -1310,6 +1375,8 @@ static int ijkff_inject_callback(void *opaque, int message, void *data, size_t d
             return onInjectIOControl(mpc, mpc.liveOpenDelegate, message, data, data_size);
         case AVAPP_EVENT_ASYNC_STATISTIC:
             return onInjectAsyncStatistic(mpc, message, data, data_size);
+        case IJKIOAPP_EVENT_CACHE_STATISTIC:
+            return onInectIJKIOStatistic(mpc, message, data, data_size);
         case AVAPP_CTRL_DID_TCP_OPEN:
             return onInjectTcpIOControl(mpc, mpc.tcpOpenDelegate, message, data, data_size);
         case AVAPP_EVENT_WILL_HTTP_OPEN:

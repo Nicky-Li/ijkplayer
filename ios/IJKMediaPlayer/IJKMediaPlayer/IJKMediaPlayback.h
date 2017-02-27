@@ -1,6 +1,7 @@
 /*
  * IJKMediaPlayback.h
  *
+ * Copyright (c) 2013 Bilibili
  * Copyright (c) 2013 Zhang Rui <bbcallen@gmail.com>
  *
  * This file is part of ijkPlayer.
@@ -95,6 +96,7 @@ typedef NS_ENUM(NSInteger, IJKMPMovieTimeOption) {
 @property (nonatomic, readonly) BOOL airPlayMediaActive;
 
 @property (nonatomic) float playbackRate;
+@property (nonatomic) float playbackVolume;
 
 - (UIImage *)thumbnailImageAtCurrentTime;
 
